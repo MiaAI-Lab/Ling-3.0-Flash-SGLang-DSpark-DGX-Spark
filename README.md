@@ -81,13 +81,19 @@ Once the container reports ready, a single server listens on `0.0.0.0:8888/v1` (
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 
-Recommended client parameters (`chat_template_kwargs`):
+Recommended client parameters:
 
 ```json
-{"temperature": 0.6, "top_p": 0.95, "top_k": 20, "chat_template_kwargs": {"enable_thinking": true}}
+{"temperature": 0.6, "top_p": 1.0, "chat_template_kwargs": {"enable_thinking": true}}
 ```
 
-Set `"enable_thinking": false` for faster/non-reasoning responses.
+**Thinking mode:** Ling‑3 is a hybrid‑thinking model, so reasoning is enabled **by default**: the server's `ling3` reasoning parser and the model's chat template both default to thinking‑on, even if you omit `chat_template_kwargs` entirely. Disable it per request if you want fast, non‑reasoning answers:
+
+```json
+{"chat_template_kwargs": {"enable_thinking": false}}
+```
+
+`temperature`/`top_p` have **no** server-side default in this setup — clients should send `temperature=0.6, top_p=1.0` explicitly (or whatever their client sets; unset falls back to OpenAI defaults of `1.0`).
 
 ## Performance
 
