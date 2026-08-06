@@ -68,7 +68,7 @@ case "${1:-}" in
     echo "    MAX_RUNNING_REQUESTS   (default: 6 concurrent)"
     echo "    MAX_MAMBA_CACHE_SIZE   (default: 32 on single Spark)"
     echo "    KV_CACHE_DTYPE         (default: fp8_e4m3; set empty to omit flag)"
-    echo "    ENABLE_NEXTN           set to 1 to pass --speculative-algorithm NEXTN"
+    echo "    ENABLE_NEXTN           (default: 1) pass --speculative-algorithm NEXTN; set to 0 to disable"
     echo "    DOCKER_MEMORY          optional docker --memory (e.g. 100g); also sets --memory-swap"
     echo "    IMAGE                  Docker image (default: ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support)"
     echo "    USE_LMSYS_IMAGE        set to 1 for lmsysorg/sglang:dev-Ling-3.0-flash instead"
@@ -431,12 +431,12 @@ cat >"${LOG_FILE}" <<EOF
 [$(date -Is)] launching SGLang container (${MODEL_ID})
 EOF
 
-# Optional flags (Spark-safe defaults; card recommends NEXTN but it is opt-in here)
+# Optional flags (Spark-safe defaults; NEXTN enabled by default as card recommends)
 EXTRA_ARGS=()
 if [[ -n "${KV_CACHE_DTYPE:-fp8_e4m3}" ]]; then
   EXTRA_ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}")
 fi
-if [[ "${ENABLE_NEXTN:-0}" == "1" ]]; then
+if [[ "${ENABLE_NEXTN:-1}" == "1" ]]; then
   EXTRA_ARGS+=(--speculative-algorithm NEXTN)
 fi
 
@@ -541,5 +541,5 @@ echo ""
 echo "  Recommended client params:"
 echo "    temperature=0.6  top_p=0.95  top_k=20"
 echo '    chat_template_kwargs: {"enable_thinking": true}'
-echo "  NEXTN: set ENABLE_NEXTN=1 to enable --speculative-algorithm NEXTN"
+echo "  NEXTN: enabled by default (--speculative-algorithm NEXTN); set ENABLE_NEXTN=0 to disable"
 echo "=============================================================================="
