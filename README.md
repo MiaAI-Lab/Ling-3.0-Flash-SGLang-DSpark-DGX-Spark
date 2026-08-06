@@ -55,7 +55,7 @@ All optional. Defaults are conservative and tuned for a single Spark host.
 |---|---|---|
 | `PORT` | `8888` | Server port |
 | `CTX` | `262144` (256k) | Context length (script default; the live host runs this) |
-| `MEM_FRACTION_STATIC` | `0.75` | SGLang static memory fraction (unified memory: stay conservative) |
+| `MEM_FRACTION_STATIC` | `0.75` | GPU memory utilization: fraction of the (unified) memory pool served to the model + KV (0.75 = 75%, 1.0 = everything). This host runs `0.70` |
 | `MAX_RUNNING_REQUESTS` | `6` | Max concurrent requests |
 | `MAX_MAMBA_CACHE_SIZE` | `32` | Mamba cache size (16 is a safer first run) |
 | `KV_CACHE_DTYPE` | `fp8_e4m3` | KV cache dtype; set to empty string to omit the flag |
@@ -131,7 +131,20 @@ Note the ×6 spike: 4.99 s TTFT at 6 concurrent requests — batch efficiency de
 - **Unified memory**: model weights, compile and KV cache all share host RAM. Keep `MEM_FRACTION_STATIC` at ≤ `0.75` and consider `DOCKER_MEMORY`. If free memory drops below ~10 GB during load, stop the container with `./stop.sh`.
 - **Context & concurrency**: the script defaults are **256k context** and **6 concurrent requests** (`CTX=262144 MAX_RUNNING_REQUESTS=6`) — matching this host. MTP is opt-in via `ENABLE_NEXTN=1` (enabled here). Constrained hosts can pull back per launch: `CTX=8192 MAX_RUNNING_REQUESTS=1 ENABLE_NEXTN=0`.
 
-## Troubleshooting
+## Monitoring memory & GPU
+
+This is a **unified-memory** machine (GB10): model weights, SGLang compile caches and the KV cache all draw from the same ~128 GB pool — there is **no discrete VRAM to query**. `nvidia-smi` therefore reports GPU compute utilization fine but returns `memory.used = [N/A]`.
+
+```bash
+# GPU utilization (memory columns are [N/A] on GB10 — expected)
+nvidia-smi
+
+# The number that actually matters on this host:
+free -h            # watch MemAvailable, not the "free" column
+watch -n2 free -h  # live view while the server is loading/serving
+```
+
+While loading, expect GPU utilization to rise and MemAvailable to fall as weights + KV cache fill host RAM. If MemAvailable drops below ~10 GB and keeps falling (or you see container restarts), stop with `./stop.sh` and relaunch with a leaner profile (`CTX=8192 MAX_RUNNING_REQUESTS=1 ENABLE_NEXTN=0`, `MEM_FRACTION_STATIC≤0.70`).
 
 - `curl http://127.0.0.1:8888/v1/models` fails → `docker logs ling-3.0-flash-int4` (first build takes minutes; startup-looking output will stream).
 - Container vanished before ready → `./stop.sh` then relaunch with `DOCKER_MEMORY=100g` and see logs.
