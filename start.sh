@@ -13,7 +13,7 @@ IMAGE="${IMAGE:-nvcr.io/nvidia/pytorch:26.01-py3}"
 CONTAINER_NAME="ling-3.0-flash-int4"
 HOST="0.0.0.0"
 PORT="${PORT:-8888}"
-CTX="${CTX:-8192}"
+CTX="${CTX:-262144}"
 WORK_DIR="$(pwd)"
 HF_HOME="${HOME}/.cache/huggingface"
 PID_FILE="${WORK_DIR}/.sglang.pid"
@@ -40,9 +40,9 @@ case "${1:-}" in
     echo ""
     echo "  Environment variables:"
     echo "    PORT                   Server port (default: 8888)"
-    echo "    CTX                    Context length (default: 8192; raise when mem allows)"
+    echo "    CTX                    Context length (default: 262144 / 256k)"
     echo "    MEM_FRACTION_STATIC    SGLang static mem fraction (default: 0.75)"
-    echo "    MAX_RUNNING_REQUESTS   (default: 1 on single Spark)"
+    echo "    MAX_RUNNING_REQUESTS   (default: 6 concurrent)"
     echo "    MAX_MAMBA_CACHE_SIZE   (default: 32 on single Spark)"
     echo "    KV_CACHE_DTYPE         (default: fp8_e4m3; set empty to omit flag)"
     echo "    ENABLE_NEXTN           set to 1 to pass --speculative-algorithm NEXTN"
@@ -361,7 +361,7 @@ docker run -d \
     --tp-size 1 \
     --ep-size 1 \
     --random-seed 308534008 \
-    --max-running-requests "${MAX_RUNNING_REQUESTS:-1}" \
+    --max-running-requests "${MAX_RUNNING_REQUESTS:-6}" \
     --max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE:-32}" \
     --chunked-prefill-size 8192 \
     --allow-auto-truncate \

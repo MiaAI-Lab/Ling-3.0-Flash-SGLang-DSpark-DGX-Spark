@@ -10,7 +10,7 @@ Designed and tested on a DGX Spark (GB10, SM121, ~128 GB unified memory) — the
 # 1. Download the INT4 weights (also validates the image/tooling)
 ./start.sh --download-only
 
-# 2. Start the server (conservative, Spark-safe defaults)
+# 2. Start the server (defaults: 256k context, 6 concurrent)
 ./start.sh
 
 # 3. Verify
@@ -54,9 +54,9 @@ All optional. Defaults are conservative and tuned for a single Spark host.
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8888` | Server port |
-| `CTX` | `8192` (script default) | Context length. The deployed profile runs `262144` (256k) |
+| `CTX` | `262144` (256k) | Context length (script default; the live host runs this) |
 | `MEM_FRACTION_STATIC` | `0.75` | SGLang static memory fraction (unified memory: stay conservative) |
-| `MAX_RUNNING_REQUESTS` | `1` | Max concurrent requests |
+| `MAX_RUNNING_REQUESTS` | `6` | Max concurrent requests |
 | `MAX_MAMBA_CACHE_SIZE` | `32` | Mamba cache size (16 is a safer first run) |
 | `KV_CACHE_DTYPE` | `fp8_e4m3` | KV cache dtype; set to empty string to omit the flag |
 | `ENABLE_NEXTN` | `0` (script default) | MTP (multi-token prediction): set `1` for `--speculative-algorithm NEXTN`. Deployed profile runs with `1` |
@@ -65,12 +65,12 @@ All optional. Defaults are conservative and tuned for a single Spark host.
 | `HF_TOKEN` | *(empty)* | Hugging Face token for gated models |
 | `HF_HOME` | `~/.cache/huggingface` | Where weights are cached |
 
-**Current deployment profile (this host):** 256k context (`CTX=262144`) **with MTP** (`ENABLE_NEXTN=1`), `MEM_FRACTION_STATIC=0.70`, mamba cache 16, `DOCKER_MEMORY=100g`. The script's conservative defaults (8k / MTP off) are the first bring-up baseline only.
+**This host's deployment profile** matches the script defaults: **256k context (`CTX=262144`)**, **6 concurrent** (`MAX_RUNNING_REQUESTS`), plus the live host also runs `ENABLE_NEXTN=1` (MTP), `MEM_FRACTION_STATIC=0.70`, mamba cache 16, `DOCKER_MEMORY=100g`. For resource-constrained hosts, the script defaults can be pulled back per launch with `CTX=8192 MAX_RUNNING_REQUESTS=1 ENABLE_NEXTN=0`.
 
 Example matching the server:
 
 ```bash
-MEM_FRACTION_STATIC=0.70 MAX_RUNNING_REQUESTS=1 MAX_MAMBA_CACHE_SIZE=16 CTX=262144 ENABLE_NEXTN=1 DOCKER_MEMORY=100g ./start.sh
+MEM_FRACTION_STATIC=0.70 MAX_RUNNING_REQUESTS=6 MAX_MAMBA_CACHE_SIZE=16 CTX=262144 ENABLE_NEXTN=1 DOCKER_MEMORY=100g ./start.sh
 ```
 
 ## Endpoint
@@ -129,7 +129,7 @@ Note the ×6 spike: 4.99 s TTFT at 6 concurrent requests — batch efficiency de
 ## Notes & safety
 
 - **Unified memory**: model weights, compile and KV cache all share host RAM. Keep `MEM_FRACTION_STATIC` at ≤ `0.75` and consider `DOCKER_MEMORY`. If free memory drops below ~10 GB during load, stop the container with `./stop.sh`.
-- **Context & MTP**: the deployed profile runs **256k context** (`CTX=262144`) with **MTP** (`ENABLE_NEXTN=1`). For cold boot on constrained memory use the script defaults (8k, MTP off), then raise `CTX` and add MTP once stable.
+- **Context & concurrency**: the script defaults are **256k context** and **6 concurrent requests** (`CTX=262144 MAX_RUNNING_REQUESTS=6`) — matching this host. MTP is opt-in via `ENABLE_NEXTN=1` (enabled here). Constrained hosts can pull back per launch: `CTX=8192 MAX_RUNNING_REQUESTS=1 ENABLE_NEXTN=0`.
 
 ## Troubleshooting
 
