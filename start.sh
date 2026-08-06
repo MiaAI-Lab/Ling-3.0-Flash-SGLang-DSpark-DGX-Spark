@@ -64,6 +64,62 @@ esac
 command -v docker >/dev/null 2>&1 || { echo "FATAL: docker is required"; exit 1; }
 command -v curl   >/dev/null 2>&1 || { echo "FATAL: curl is required";   exit 1; }
 
+# ---- Preflight checks (fail with a clear message, not a cryptic error) ------
+# Docker daemon
+if ! docker info >/dev/null 2>&1; then
+  echo "FATAL: Docker daemon is not reachable (docker info failed)."
+  exit 1
+fi
+
+# NVIDIA driver on the host
+if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+  echo "FATAL: No NVIDIA driver found (nvidia-smi -L failed)."
+  echo "       Install the NVIDIA driver for this GPU before continuing."
+  exit 1
+fi
+
+# NVIDIA container runtime (required for 'docker run --gpus all')
+if ! command -v nvidia-container-runtime >/dev/null 2>&1 \
+  && ! command -v nvidia-container-runtime-hook >/dev/null 2>&1 \
+  && ! docker info 2>/dev/null | grep -qi 'nvidia'; then
+  echo "FATAL: NVIDIA container runtime not found — '--gpus all' will fail."
+  echo "       Install nvidia-container-toolkit, e.g.:"
+  echo "         sudo apt-get install -y nvidia-container-toolkit"
+  echo "         sudo systemctl restart docker"
+  exit 1
+fi
+
+# Host memory (unified memory: model + compile + KV all share host RAM)
+MEM_TOTAL_GIB=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 / 1024 ))
+if (( MEM_TOTAL_GIB < 80 )); then
+  echo "FATAL: host has only ${MEM_TOTAL_GIB} GiB RAM; Ling-3.0-flash-int4 needs ~100+ GiB."
+  exit 1
+fi
+if (( MEM_TOTAL_GIB < 110 )); then
+  echo "WARN:  ${MEM_TOTAL_GIB} GiB RAM is below the DGX Spark class (~119 GiB)."
+  echo "       Use conservative env (MEM_FRACTION_STATIC=0.70, MAX_MAMBA_CACHE_SIZE=16)."
+fi
+
+# Free disk for image (~20 GB) + weights + SGLang build
+FREE_GIB=$(( $(df -Pk "${WORK_DIR}" | awk 'NR==2 {print $4}') / 1024 / 1024 ))
+if (( FREE_GIB < 40 )); then
+  echo "FATAL: only ${FREE_GIB} GiB free on ${WORK_DIR} — need >= 40 GiB."
+  exit 1
+fi
+if (( FREE_GIB < 100 )); then
+  echo "WARN:  only ${FREE_GIB} GiB free on ${WORK_DIR} — keep an eye on disk usage."
+fi
+
+# Ports (host network: must be free on the host)
+if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") >/dev/null 2>&1; then
+  echo "FATAL: port ${PORT} is already in use — a server may already be running."
+  echo "       Run ./stop.sh first, or pick another port via PORT=<port>."
+  exit 1
+fi
+if (exec 3<>'/dev/tcp/127.0.0.1/2345') >/dev/null 2>&1; then
+  echo "WARN:  internal dist port 2345 is in use; SGLang may fail to bind."
+fi
+
 # ---- Env exports (also passed to container) ---------------------------------
 export HF_HOME
 export HF_TOKEN="${HF_TOKEN:-}"

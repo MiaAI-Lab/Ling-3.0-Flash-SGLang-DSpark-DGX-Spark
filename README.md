@@ -34,6 +34,22 @@ The first start compiles and installs SGLang (branch `ling_v3_support`) into `.s
 - CUDA-capable Docker runtime (`--gpus all`)
 - ~Free disk space for the model weights + a ~20 GB NGC PyTorch image (auto-pulled: `nvcr.io/nvidia/pytorch:26.01-py3`)
 
+# Ping-pong: start.sh now checks the environment before doing anything
+# and prints FATAL/WARN with actionable hints instead of cryptic errors.
+
+## Preflight checks
+
+`start.sh` fails fast with a clear message (not a cryptic crash) if the new machine isn't ready:
+
+- Docker daemon is reachable
+- NVIDIA driver present (`nvidia-smi -L`)
+- NVIDIA container runtime installed (required for `--gpus all`) — hint for `nvidia-container-toolkit` if missing
+- Host RAM is at least 80 GiB (warns below 110 GiB, the DGX Spark class)
+- 40 GiB+ free disk in the script directory (warns below 100 GiB)
+- Ports are free: the server port and internal dist port 2345
+
+If a server is already running on the same port, it exits with a hint to run `./stop.sh` first.
+
 ## Environment variables
 
 All optional. Defaults are conservative and tuned for a single Spark host.
