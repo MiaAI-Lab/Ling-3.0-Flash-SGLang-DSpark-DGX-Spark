@@ -2,7 +2,7 @@
 
 Self-hosted OpenAI-compatible endpoint for [inclusionAI/Ling-3.0-flash-int4](https://huggingface.co/inclusionAI/Ling-3.0-flash-int4) served with [SGLang](https://github.com/sgl-project/sglang) in Docker.
 
-Designed and tested on a DGX Spark (GB10, SM121, ~128 GB unified memory) — the official INT4 recipe, no MXFP4/Cutlass fallbacks. `start.sh` and `stop.sh` are the only moving parts: they build, cache, and run everything.
+Designed and tested on a DGX Spark (GB10, SM121, ~128 GB unified memory) — the official INT4 recipe. `start.sh` and `stop.sh` are the only moving parts: they build, cache, and run everything.
 
 ## Quick start
 
@@ -34,9 +34,6 @@ The first start compiles and installs SGLang (branch `ling_v3_support`) into `.s
 - CUDA-capable Docker runtime (`--gpus all`)
 - ~Free disk space for the model weights + a ~20 GB NGC PyTorch image (auto-pulled: `nvcr.io/nvidia/pytorch:26.01-py3`)
 
-# Ping-pong: start.sh now checks the environment before doing anything
-# and prints FATAL/WARN with actionable hints instead of cryptic errors.
-
 ## Preflight checks
 
 `start.sh` fails fast with a clear message (not a cryptic crash) if the new machine isn't ready:
@@ -57,21 +54,23 @@ All optional. Defaults are conservative and tuned for a single Spark host.
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8888` | Server port |
-| `CTX` | `8192` | Context length. Raise only after a baseline run works |
+| `CTX` | `8192` (script default) | Context length. The deployed profile runs `262144` (256k) |
 | `MEM_FRACTION_STATIC` | `0.75` | SGLang static memory fraction (unified memory: stay conservative) |
 | `MAX_RUNNING_REQUESTS` | `1` | Max concurrent requests |
 | `MAX_MAMBA_CACHE_SIZE` | `32` | Mamba cache size (16 is a safer first run) |
 | `KV_CACHE_DTYPE` | `fp8_e4m3` | KV cache dtype; set to empty string to omit the flag |
-| `ENABLE_NEXTN` | `0` | Set `1` to enable `--speculative-algorithm NEXTN` |
+| `ENABLE_NEXTN` | `0` (script default) | MTP (multi-token prediction): set `1` for `--speculative-algorithm NEXTN`. Deployed profile runs with `1` |
 | `DOCKER_MEMORY` | *(unset)* | Cap the container, e.g. `100g` — preferred on unified-memory hosts so the container dies before the host OOMs |
 | `IMAGE` | `nvcr.io/nvidia/pytorch:26.01-py3` | Docker image |
 | `HF_TOKEN` | *(empty)* | Hugging Face token for gated models |
 | `HF_HOME` | `~/.cache/huggingface` | Where weights are cached |
 
-Example with a host memory cap and tighter settings:
+**Current deployment profile (this host):** 256k context (`CTX=262144`) **with MTP** (`ENABLE_NEXTN=1`), `MEM_FRACTION_STATIC=0.70`, mamba cache 16, `DOCKER_MEMORY=100g`. The script's conservative defaults (8k / MTP off) are the first bring-up baseline only.
+
+Example matching the server:
 
 ```bash
-MEM_FRACTION_STATIC=0.70 MAX_RUNNING_REQUESTS=1 MAX_MAMBA_CACHE_SIZE=16 CTX=8192 DOCKER_MEMORY=100g ./start.sh
+MEM_FRACTION_STATIC=0.70 MAX_RUNNING_REQUESTS=1 MAX_MAMBA_CACHE_SIZE=16 CTX=262144 ENABLE_NEXTN=1 DOCKER_MEMORY=100g ./start.sh
 ```
 
 ## Endpoint
@@ -81,7 +80,7 @@ Once the container reports ready, a single server listens on `0.0.0.0:8888/v1` (
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 
-Recommended client parameters:
+Default request config (recommended — matches the server's defaults):
 
 ```json
 {"temperature": 0.6, "top_p": 1.0, "chat_template_kwargs": {"enable_thinking": true}}
@@ -97,7 +96,7 @@ Recommended client parameters:
 
 ## Performance
 
-Decode throughput for `inclusionAI/Ling-3.0-flash-int4` on this DGX Spark (GB10), measured with the container defaults (`MEM_FRACTION_STATIC=0.75`, `--chunked-prefill-size 8192`, INT4 `ling_v3_support` branch):
+Decode throughput for `inclusionAI/Ling-3.0-flash-int4` on this DGX Spark (GB10), measured during the bring-up baseline (`MEM_FRACTION_STATIC=0.75`, `--chunked-prefill-size 8192`, INT4 `ling_v3_support`):
 
 | Concurrency | Aggregate (tok/s) | Per-request (tok/s) | TTFT |
 |---|---|---|---|
@@ -130,8 +129,7 @@ Note the ×6 spike: 4.99 s TTFT at 6 concurrent requests — batch efficiency de
 ## Notes & safety
 
 - **Unified memory**: model weights, compile and KV cache all share host RAM. Keep `MEM_FRACTION_STATIC` at ≤ `0.75` and consider `DOCKER_MEMORY`. If free memory drops below ~10 GB during load, stop the container with `./stop.sh`.
-- **No MXFP4**: this repo deliberately uses the INT4 `ling_v3_support` path. The FP4 `flashinfer_mxfp4`/Cutlass path is known-good to OOM/hang this hardware class and is intentionally not supported.
-- **Tuning knobs**: after a stable baseline, raise `CTX` gradually, or re-run with `ENABLE_NEXTN=1` to speed up speculative decoding (chipset support varies).
+- **Context & MTP**: the deployed profile runs **256k context** (`CTX=262144`) with **MTP** (`ENABLE_NEXTN=1`). For cold boot on constrained memory use the script defaults (8k, MTP off), then raise `CTX` and add MTP once stable.
 
 ## Troubleshooting
 
