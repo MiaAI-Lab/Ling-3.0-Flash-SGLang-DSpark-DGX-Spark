@@ -89,6 +89,22 @@ Recommended client parameters (`chat_template_kwargs`):
 
 Set `"enable_thinking": false` for faster/non-reasoning responses.
 
+## Performance
+
+Decode throughput for `inclusionAI/Ling-3.0-flash-int4` on this DGX Spark (GB10), measured with the container defaults (`MEM_FRACTION_STATIC=0.75`, `--chunked-prefill-size 8192`, INT4 `ling_v3_support` branch):
+
+| Concurrency | Aggregate (tok/s) | Per-request (tok/s) | TTFT |
+|---|---|---|---|
+| ×1 | 37 | 37 | 220 ms |
+| ×2 | 54 | 28 | 383 ms |
+| ×4 | 60 | 28 | 421 ms |
+| ×5 | 65 | 27 | 350 ms |
+| ×6 | 76 | 26 | 4.99 s |
+
+**agg** = server-wide decoded tokens per second; **str** = per-request tokens per second; **TTFT** = time to first token.
+
+Note the ×6 spike: 4.99 s TTFT at 6 concurrent requests — batch efficiency degrades past ×5 under this configuration.
+
 ## Files
 
 | File | Purpose |
