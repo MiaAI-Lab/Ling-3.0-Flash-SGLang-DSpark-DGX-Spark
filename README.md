@@ -2,15 +2,15 @@
 
 Self-hosted OpenAI-compatible endpoint for [inclusionAI/Ling-3.0-flash-int4](https://huggingface.co/inclusionAI/Ling-3.0-flash-int4) served with [SGLang](https://github.com/sgl-project/sglang) in Docker.
 
-Designed and tested on a DGX Spark (GB10, SM121, ~128 GB unified memory) — the official INT4 recipe. `start.sh` and `stop.sh` are the only moving parts: they build, cache, and run everything.
+Designed and tested on a DGX Spark (GB10, SM121, ~128 GB unified memory) — the official INT4 recipe. `start.sh` and `stop.sh` are the only moving parts: they pull a prebuilt runtime, cache weights, and serve.
 
 ## Quick start
 
 ```bash
-# 1. Download the INT4 weights (also validates the image/tooling)
+# 1. Download the INT4 weights
 ./start.sh --download-only
 
-# 2. Start the server (defaults: 256k context, 6 concurrent)
+# 2. Start the server (pulls prebuilt image; defaults: 256k context, 6 concurrent)
 ./start.sh
 
 # 3. Verify
@@ -25,14 +25,33 @@ curl -sS -m 180 http://127.0.0.1:8888/v1/chat/completions \
 ./stop.sh
 ```
 
-The first start compiles and installs SGLang (branch `ling_v3_support`) into `.sglang-persist/` — this takes several minutes. Subsequent starts reuse it.
+### Prebuilt runtime (required for new users — no private git)
+
+InclusionAI’s INT4 card still points at `github.com/inclusionAI/sglang_ling_v3`, which is often **private / 404**. **Do not rely on that clone.** `start.sh` pulls a **public** prebuilt image:
+
+| Image | When |
+|---|---|
+| **`ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support`** (default) | Public GHCR — NGC PyTorch + baked `ling_v3_support` (INT4 on Spark) |
+| `lmsysorg/sglang:dev-Ling-3.0-flash` | Official LMSYS Ling runtime (`USE_LMSYS_IMAGE=1` or `IMAGE=...`) |
+
+```bash
+# Default (Spark GHCR, public — no docker login)
+./start.sh
+
+# Optional official LMSYS image
+USE_LMSYS_IMAGE=1 ./start.sh
+# or
+IMAGE=lmsysorg/sglang:dev-Ling-3.0-flash ./start.sh
+```
+
+Package: https://github.com/users/MiaAI-Lab/packages/container/package/ling-3.0-flash-sglang-dgx-spark
 
 ## Requirements
 
 - Linux with **Docker** (`docker` in `PATH`) and `curl`
 - An NVIDIA GPU with enough unified/VRAM memory (~120 GB+ recommended for this model class)
 - CUDA-capable Docker runtime (`--gpus all`)
-- ~Free disk space for the model weights + a ~20 GB NGC PyTorch image (auto-pulled: `nvcr.io/nvidia/pytorch:26.01-py3`)
+- Free disk for model weights + a prebuilt runtime image (~25–30 GB)
 
 ## Preflight checks
 
@@ -61,9 +80,11 @@ All optional. Defaults are conservative and tuned for a single Spark host.
 | `KV_CACHE_DTYPE` | `fp8_e4m3` | KV cache dtype; set to empty string to omit the flag |
 | `ENABLE_NEXTN` | `0` (script default) | MTP (multi-token prediction): set `1` for `--speculative-algorithm NEXTN`. Deployed profile runs with `1` |
 | `DOCKER_MEMORY` | *(unset)* | Cap the container, e.g. `100g` — preferred on unified-memory hosts so the container dies before the host OOMs |
-| `IMAGE` | `nvcr.io/nvidia/pytorch:26.01-py3` | Docker image |
+| `IMAGE` | `ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support` | Prebuilt SGLang (public GHCR; no private git) |
+| `USE_LMSYS_IMAGE` | `0` | Set `1` to use `lmsysorg/sglang:dev-Ling-3.0-flash` instead |
 | `HF_TOKEN` | *(empty)* | Hugging Face token for gated models |
 | `HF_HOME` | `~/.cache/huggingface` | Where weights are cached |
+| `FORCE_SOURCE_BUILD` | `0` | Set `1` only to rebuild from `SGLANG_REPO` (usually unnecessary) |
 
 **This host's deployment profile** matches the script defaults: **256k context (`CTX=262144`)**, **6 concurrent** (`MAX_RUNNING_REQUESTS`), plus the live host also runs `ENABLE_NEXTN=1` (MTP), `MEM_FRACTION_STATIC=0.70`, mamba cache 16, `DOCKER_MEMORY=100g`. For resource-constrained hosts, the script defaults can be pulled back per launch with `CTX=8192 MAX_RUNNING_REQUESTS=1 ENABLE_NEXTN=0`.
 
@@ -114,14 +135,14 @@ Note the ×6 spike: 4.99 s TTFT at 6 concurrent requests — batch efficiency de
 
 | File | Purpose |
 |---|---|
-| `start.sh` | Download model, build/persist SGLang, launch container, wait for readiness |
+| `start.sh` | Download model, pull public runtime image, launch container, wait for readiness |
 | `stop.sh` | Confirm and stop/remove the container; cleans up PID + tmp files |
 
 ## How it works
 
 1. `start.sh` caches the `Ling-3.0-flash-int4` weights under `$HF_HOME` (uses `hf`, `huggingface-cli`, or falls back to a Docker download).
-2. It writes a bootstrap script that, on first run, clones `inclusionAI/sglang_ling_v3` @ `ling_v3_support`, installs Rust + a venv, and `pip install -e`s SGLang — **persisted** in `.sglang-persist/` so subsequent starts skip the ~10 min build.
-3. The container runs with `--network host`, `--ipc host`, `--gpus all`, `--shm-size=32g`, and the model snapshot mounted read-only from the HF cache.
+2. It pulls a **public prebuilt** image with SGLang already installed (no `git clone` of the private InclusionAI fork).
+3. The container runs with `--network host`, `--ipc host`, `--gpus all`, `--shm-size=32g`, and the model snapshot from the HF cache.
 4. `start.sh` tails the logs and blocks until `/v1/models` responds, then prints the endpoint.
 
 `.sglang.pid` holds the container ID, `.sglang.log` the launch line; both live in this directory and are removed by `stop.sh`.

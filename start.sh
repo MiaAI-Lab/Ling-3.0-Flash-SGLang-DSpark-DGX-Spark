@@ -2,14 +2,31 @@
 # =============================================================================
 #  start.sh — inclusionAI/Ling-3.0-flash-int4 on DGX Spark (GB10 / SM121)
 #
-#  Official INT4 recipe: branch ling_v3_support (no flashinfer_mxfp4).
-#  Spark: tp-size 1, conservative mem defaults.
+#  Default: public prebuilt Docker image — no private GitHub clone required.
+#  Spark: tp-size 1, conservative mem defaults. No flashinfer_mxfp4 / FP4.
 # =============================================================================
 set -euo pipefail
 
 # ---- Configuration ----------------------------------------------------------
 MODEL_ID="inclusionAI/Ling-3.0-flash-int4"
-IMAGE="${IMAGE:-nvcr.io/nvidia/pytorch:26.01-py3}"
+# Public images (new users need one of these — never requires inclusionAI/sglang_ling_v3):
+#   1) Spark-tuned (baked ling_v3_support): ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support
+#   2) Official LMSYS Ling-3.0 runtime:     lmsysorg/sglang:dev-Ling-3.0-flash
+# Source rebuild only if you set IMAGE to a bare base (e.g. nvcr.io/nvidia/pytorch:26.01-py3)
+# and FORCE_SOURCE_BUILD=1 (needs a public SGLANG_REPO mirror; official fork is often private).
+# Always default to a public registry image. Spark-tuned GHCR is preferred on
+# aarch64 when available; LMSYS is the universal public fallback.
+DEFAULT_SPARK_IMAGE="ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support"
+DEFAULT_PUBLIC_IMAGE="lmsysorg/sglang:dev-Ling-3.0-flash"
+if [[ -z "${IMAGE:-}" ]]; then
+  # Default: Spark GHCR (public; baked ling_v3_support for INT4). LMSYS is fallback
+  # if the pull fails, or set USE_LMSYS_IMAGE=1 / IMAGE=lmsysorg/sglang:dev-Ling-3.0-flash.
+  if [[ "${USE_LMSYS_IMAGE:-0}" == "1" ]]; then
+    IMAGE="${DEFAULT_PUBLIC_IMAGE}"
+  else
+    IMAGE="${DEFAULT_SPARK_IMAGE}"
+  fi
+fi
 CONTAINER_NAME="ling-3.0-flash-int4"
 HOST="0.0.0.0"
 PORT="${PORT:-8888}"
@@ -20,10 +37,14 @@ PID_FILE="${WORK_DIR}/.sglang.pid"
 LOG_FILE="${WORK_DIR}/.sglang.log"
 BOOTSTRAP_SCRIPT="/tmp/ling-bootstrap.sh"
 FLASHINFER_CACHE_DIR="${FLASHINFER_CACHE_DIR:-${HOME}/.cache/flashinfer}"
-# Persist SGLang + venv across container recreates (avoids 10+ min reinstall)
+# Host-side SGLang tree (optional). Only bind-mounted when already installed so an
+# empty host dir does not hide a prebaked /opt/sglang-persist inside the image.
 SGLANG_PERSIST_DIR="${SGLANG_PERSIST_DIR:-${WORK_DIR}/.sglang-persist}"
 READY_URL="http://127.0.0.1:${PORT}/v1/models"
-SGLANG_BRANCH="ling_v3_support"
+SGLANG_BRANCH="${SGLANG_BRANCH:-ling_v3_support}"
+# Only used when FORCE_SOURCE_BUILD=1. inclusionAI/sglang_ling_v3 is often private.
+SGLANG_REPO="${SGLANG_REPO:-https://github.com/inclusionAI/sglang_ling_v3.git}"
+FORCE_SOURCE_BUILD="${FORCE_SOURCE_BUILD:-0}"
 
 # ---- Argument parsing -------------------------------------------------------
 DOWNLOAD_ONLY=false
@@ -47,8 +68,13 @@ case "${1:-}" in
     echo "    KV_CACHE_DTYPE         (default: fp8_e4m3; set empty to omit flag)"
     echo "    ENABLE_NEXTN           set to 1 to pass --speculative-algorithm NEXTN"
     echo "    DOCKER_MEMORY          optional docker --memory (e.g. 100g); also sets --memory-swap"
-    echo "    IMAGE                  Docker image (default: nvcr.io/nvidia/pytorch:26.01-py3)"
+    echo "    IMAGE                  Docker image (default: ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support)"
+    echo "    USE_LMSYS_IMAGE        set to 1 for lmsysorg/sglang:dev-Ling-3.0-flash instead"
     echo "    HF_TOKEN               Hugging Face token for gated models"
+    echo "    FORCE_SOURCE_BUILD     set to 1 to git-clone SGLANG_REPO into the container"
+    echo "                           (not needed for public prebuilt images)"
+    echo "    SGLANG_REPO            Git URL if FORCE_SOURCE_BUILD=1"
+    echo "    GITHUB_TOKEN           Optional; private git clone / private GHCR pull"
     exit 0
     ;;
   "")
@@ -216,64 +242,137 @@ if ${DOWNLOAD_ONLY}; then
 fi
 
 # ---- Bootstrap script -------------------------------------------------------
-# Official INT4 card: branch ling_v3_support (no MXFP4 / flashinfer_mxfp4).
+# Default path: use SGLang already in the image (or host-mounted persist).
+# Source path: only when FORCE_SOURCE_BUILD=1 (private git is not required for normal runs).
 # https://huggingface.co/inclusionAI/Ling-3.0-flash-int4
-cat > "${BOOTSTRAP_SCRIPT}" << 'BOOTSTRAP'
+# https://docs.sglang.io/cookbook/autoregressive/InclusionAI/Ling-3.0-flash
+cat > "${BOOTSTRAP_SCRIPT}" << BOOTSTRAP
 #!/bin/bash
 set -e
 
 PERSIST="/opt/sglang-persist"
-SGLANG_DIR="${PERSIST}/sglang_ling_v3"
-VENV="${PERSIST}/venv"
-SGLANG_BRANCH="ling_v3_support"
+SGLANG_DIR="\${PERSIST}/sglang_ling_v3"
+VENV="\${PERSIST}/venv"
+SGLANG_BRANCH="${SGLANG_BRANCH}"
+SGLANG_REPO="${SGLANG_REPO}"
+FORCE_SOURCE_BUILD="${FORCE_SOURCE_BUILD}"
+GITHUB_TOKEN="\${GITHUB_TOKEN:-}"
 
-# NGC PyTorch pins some packages via PIP_CONSTRAINT; clear for clean installs.
-if [[ -n "${PIP_CONSTRAINT:-}" ]]; then
-  echo "[bootstrap] Clearing PIP_CONSTRAINT (${PIP_CONSTRAINT})"
+if [[ -n "\${PIP_CONSTRAINT:-}" ]]; then
+  echo "[bootstrap] Clearing PIP_CONSTRAINT (\${PIP_CONSTRAINT})"
   unset PIP_CONSTRAINT
 fi
 
-export PATH="/root/.cargo/bin:${PATH}"
-mkdir -p "${PERSIST}"
+export PATH="/root/.cargo/bin:\${PATH}"
+mkdir -p "\${PERSIST}"
 
-if [[ -f "${SGLANG_DIR}/.installed" ]] \
-  && grep -qx "branch=${SGLANG_BRANCH}" "${SGLANG_DIR}/.installed" 2>/dev/null \
-  && [[ -x "${VENV}/bin/python" ]]; then
-  echo "[bootstrap] Reusing persisted install at ${SGLANG_DIR} (branch ${SGLANG_BRANCH})"
-  # shellcheck disable=SC1091
-  source "${VENV}/bin/activate"
-else
-  echo "[bootstrap] Building persisted install under ${PERSIST} (branch ${SGLANG_BRANCH}) …"
-  rm -rf "${SGLANG_DIR}" "${VENV}"
-  git clone -b "${SGLANG_BRANCH}" https://github.com/inclusionAI/sglang_ling_v3.git "${SGLANG_DIR}"
-  cd "${SGLANG_DIR}"
+sglang_tree_ok() {
+  [[ -d "\${SGLANG_DIR}/python/sglang" ]] || return 1
+  [[ -f "\${SGLANG_DIR}/python/pyproject.toml" ]] || return 1
+  return 0
+}
 
-  if ! command -v rustc &>/dev/null; then
-    echo "[bootstrap] Installing Rust …"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+activate_venv_if_present() {
+  if [[ -x "\${VENV}/bin/python" ]]; then
+    # shellcheck disable=SC1091
+    source "\${VENV}/bin/activate"
+    return 0
   fi
+  return 1
+}
 
-  echo "[bootstrap] Creating venv + installing SGLang …"
-  python3 -m venv --system-site-packages "${VENV}"
-  # shellcheck disable=SC1091
-  source "${VENV}/bin/activate"
-  pip install --upgrade pip
-  pip install -e "python"
+launch_sglang() {
+  echo "[bootstrap] Starting SGLang server (Ling-3.0-flash-int4) …"
+  if activate_venv_if_present; then
+    exec python -m sglang.launch_server "\$@"
+  fi
+  if command -v sglang >/dev/null 2>&1; then
+    # Official LMSYS images: preferred entrypoint is \`sglang serve\`
+    exec sglang serve "\$@"
+  fi
+  if python3 -c "import sglang" 2>/dev/null; then
+    exec python3 -m sglang.launch_server "\$@"
+  fi
+  echo "[bootstrap] FATAL: no SGLang runtime in this image."
+  echo "  Use a prebuilt image, e.g.:"
+  echo "    IMAGE=lmsysorg/sglang:dev-Ling-3.0-flash"
+  echo "    IMAGE=ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support"
+  echo "  Or FORCE_SOURCE_BUILD=1 with a public SGLANG_REPO mirror."
+  exit 1
+}
 
-  {
-    date
-    echo "branch=${SGLANG_BRANCH}"
-  } > "${SGLANG_DIR}/.installed"
-  echo "[bootstrap] SGLang installed (persisted)"
+clone_sglang() {
+  local dest="\$1"
+  local url="\${SGLANG_REPO}"
+  if [[ -n "\${GITHUB_TOKEN}" && "\${url}" =~ ^https://github.com/ ]]; then
+    url="https://x-access-token:\${GITHUB_TOKEN}@\${url#https://}"
+  fi
+  echo "[bootstrap] git clone -b \${SGLANG_BRANCH} \${SGLANG_REPO} …"
+  if ! git clone -b "\${SGLANG_BRANCH}" "\${url}" "\${dest}"; then
+    echo "[bootstrap] FATAL: could not clone \${SGLANG_REPO} (branch \${SGLANG_BRANCH})."
+    echo "  inclusionAI/sglang_ling_v3 is often private (GitHub returns 'Repository not found')."
+    echo "  Prefer a public prebuilt image instead of source build:"
+    echo "    IMAGE=lmsysorg/sglang:dev-Ling-3.0-flash ./start.sh"
+    echo "    IMAGE=ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support ./start.sh"
+    return 1
+  fi
+}
+
+if [[ "\${FORCE_SOURCE_BUILD}" == "1" ]]; then
+  echo "[bootstrap] FORCE_SOURCE_BUILD=1 — installing from \${SGLANG_REPO} …"
+  if sglang_tree_ok && [[ -x "\${VENV}/bin/python" ]]; then
+    echo "[bootstrap] Reusing existing source tree + venv"
+  elif sglang_tree_ok; then
+    echo "[bootstrap] Rebuilding venv from existing source (no clone) …"
+    rm -rf "\${VENV}"
+    cd "\${SGLANG_DIR}"
+    command -v rustc &>/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    python3 -m venv --system-site-packages "\${VENV}"
+    # shellcheck disable=SC1091
+    source "\${VENV}/bin/activate"
+    pip install --upgrade pip
+    pip install -e "python"
+    { date; echo "branch=\${SGLANG_BRANCH}"; } > "\${SGLANG_DIR}/.installed"
+  else
+    rm -rf "\${SGLANG_DIR}.new" "\${VENV}"
+    clone_sglang "\${SGLANG_DIR}.new"
+    rm -rf "\${SGLANG_DIR}"
+    mv "\${SGLANG_DIR}.new" "\${SGLANG_DIR}"
+    cd "\${SGLANG_DIR}"
+    command -v rustc &>/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    python3 -m venv --system-site-packages "\${VENV}"
+    # shellcheck disable=SC1091
+    source "\${VENV}/bin/activate"
+    pip install --upgrade pip
+    pip install -e "python"
+    { date; echo "branch=\${SGLANG_BRANCH}"; } > "\${SGLANG_DIR}/.installed"
+  fi
+else
+  if sglang_tree_ok && [[ -x "\${VENV}/bin/python" ]]; then
+    echo "[bootstrap] Using prebuilt/persisted SGLang at \${SGLANG_DIR}"
+  else
+    echo "[bootstrap] Using image-provided SGLang (no git clone)"
+  fi
 fi
 
-echo "[bootstrap] Starting SGLang server (Ling-3.0-flash-int4) …"
-# shellcheck disable=SC1091
-source "${VENV}/bin/activate"
-exec python -m sglang.launch_server "$@"
+launch_sglang "\$@"
 BOOTSTRAP
 chmod +x "${BOOTSTRAP_SCRIPT}"
-mkdir -p "${SGLANG_PERSIST_DIR}"
+
+# Host persist is only useful if it already has a working install. An empty
+# bind-mount would hide the prebaked tree inside the image.
+host_sglang_ok() {
+  [[ -d "${SGLANG_PERSIST_DIR}/sglang_ling_v3/python/sglang" ]] \
+    && [[ -x "${SGLANG_PERSIST_DIR}/venv/bin/python" ]]
+}
+SGLANG_VOLUME_ARGS=()
+if host_sglang_ok; then
+  echo "Using host SGLang persist: ${SGLANG_PERSIST_DIR}"
+  SGLANG_VOLUME_ARGS+=(-v "${SGLANG_PERSIST_DIR}:/opt/sglang-persist")
+else
+  echo "Using image-baked SGLang (no host .sglang-persist mount)"
+  mkdir -p "${SGLANG_PERSIST_DIR}"
+fi
 
 # ---- Container lifecycle ----------------------------------------------------
 # Remove any existing container (running or stale) so we start fresh.
@@ -306,7 +405,24 @@ echo "Model snapshot: ${HF_MODEL_CACHE}/snapshots/${SNAPSHOT_DIR}"
 echo ""
 
 echo "Pulling ${IMAGE} ..."
-docker pull "${IMAGE}" 2>&1 || { echo "Failed to pull image"; exit 1; }
+if ! docker pull "${IMAGE}" 2>&1; then
+  echo "FATAL: failed to pull ${IMAGE}"
+  echo "  Public alternatives:"
+  echo "    IMAGE=lmsysorg/sglang:dev-Ling-3.0-flash ./start.sh"
+  echo "    IMAGE=ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support ./start.sh"
+  echo "  Private GHCR: docker login ghcr.io -u USER --password-stdin  (then re-pull)"
+  # Fall back to official public LMSYS image if the Spark GHCR tag is missing.
+  if [[ "${IMAGE}" == "${DEFAULT_SPARK_IMAGE}" ]]; then
+    echo "  Retrying with public LMSYS image: ${DEFAULT_PUBLIC_IMAGE}"
+    IMAGE="${DEFAULT_PUBLIC_IMAGE}"
+    if ! docker pull "${IMAGE}" 2>&1; then
+      echo "FATAL: also failed to pull ${IMAGE}"
+      exit 1
+    fi
+  else
+    exit 1
+  fi
+fi
 echo ""
 
 cat >"${LOG_FILE}" <<EOF
@@ -347,10 +463,11 @@ docker run -d \
   -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
   -e HF_HOME=/root/.cache/huggingface \
   -e HF_TOKEN="${HF_TOKEN:-}" \
+  -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
   -v "${BOOTSTRAP_SCRIPT}:/bootstrap.sh:ro" \
   -v "${HF_HOME}:/root/.cache/huggingface" \
   -v "${FLASHINFER_CACHE_DIR}:/root/.cache/flashinfer" \
-  -v "${SGLANG_PERSIST_DIR}:/opt/sglang-persist" \
+  "${SGLANG_VOLUME_ARGS[@]}" \
   -v "${WORK_DIR}:/workspace" \
   "${IMAGE}" \
   --model-path "${MODEL_PATH_IN_CONTAINER}" \
