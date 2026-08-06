@@ -28,7 +28,8 @@ if [[ -z "${IMAGE:-}" ]]; then
   fi
 fi
 CONTAINER_NAME="ling-3.0-flash-int4"
-HOST="0.0.0.0"
+# Bind address for sglang serve / launch_server (--host). Docker uses --network host.
+HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
 CTX="${CTX:-262144}"
 WORK_DIR="$(pwd)"
@@ -61,6 +62,7 @@ case "${1:-}" in
     echo ""
     echo "  Environment variables:"
     echo "    PORT                   Server port (default: 8888)"
+    echo "    HOST                   Bind address for SGLang (default: 0.0.0.0)"
     echo "    CTX                    Context length (default: 262144 / 256k)"
     echo "    MEM_FRACTION_STATIC    SGLang static mem fraction (default: 0.75)"
     echo "    MAX_RUNNING_REQUESTS   (default: 6 concurrent)"
@@ -474,6 +476,7 @@ docker run -d \
     --trust-remote-code \
     --nnodes 1 \
     --dist-init-addr "127.0.0.1:2345" \
+    --host "${HOST}" \
     --port "${PORT}" \
     --tp-size 1 \
     --ep-size 1 \
@@ -529,7 +532,11 @@ echo ""
 echo "=============================================================================="
 echo "  SGLang is ready!"
 echo "  Model: ${MODEL_ID}"
-echo "  OpenAI-compatible endpoint:  http://${HOST}:${PORT}/v1"
+if [[ "${HOST}" == "0.0.0.0" || "${HOST}" == "::" ]]; then
+  echo "  OpenAI-compatible endpoint:  http://127.0.0.1:${PORT}/v1  (bound on ${HOST})"
+else
+  echo "  OpenAI-compatible endpoint:  http://${HOST}:${PORT}/v1"
+fi
 echo ""
 echo "  Recommended client params:"
 echo "    temperature=0.6  top_p=0.95  top_k=20"
