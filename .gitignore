@@ -1,0 +1,11 @@
+# Only track the public surface of this repo: start/stop scripts and README.
+# Everything else here is machine-local state.
+
+# Ignore everything by default…
+/*
+
+# …except the files we want on GitHub:
+!.gitignore
+!/start.sh
+!/stop.sh
+!/README.md
