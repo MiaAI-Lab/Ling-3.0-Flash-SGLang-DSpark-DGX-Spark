@@ -4,11 +4,22 @@
 #
 #  Default: public prebuilt Docker image — no private GitHub clone required.
 #  Spark: tp-size 1, conservative mem defaults. No flashinfer_mxfp4 / FP4.
+#
+#  Speculative decoding (SPEC_ALGO):
+#    dspark — DSPARK with the external inclusionAI/Ling-3.0-flash-dspark draft
+#             (1.36B, 5 layers; needs a recent SGLang → defaults to the LMSYS
+#             Ling image). Verify window 9 (block size 8) with the KDA
+#             ReplaySSM ring pinned to --linear-replayssm-cache-len 32.
+#    nextn  — built-in MTP layer (no extra checkpoint; ling_v3_support image OK)
+#    off    — no speculative decoding
 # =============================================================================
 set -euo pipefail
 
 # ---- Configuration ----------------------------------------------------------
 MODEL_ID="inclusionAI/Ling-3.0-flash-int4"
+# External DSpark draft checkpoint for --speculative-algorithm DSPARK
+# https://huggingface.co/inclusionAI/Ling-3.0-flash-dspark
+DSPARK_MODEL_ID="inclusionAI/Ling-3.0-flash-dspark"
 # Public images (new users need one of these — never requires inclusionAI/sglang_ling_v3):
 #   1) Spark-tuned (baked ling_v3_support): ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support
 #   2) Official LMSYS Ling-3.0 runtime:     lmsysorg/sglang:dev-Ling-3.0-flash
@@ -18,10 +29,36 @@ MODEL_ID="inclusionAI/Ling-3.0-flash-int4"
 # aarch64 when available; LMSYS is the universal public fallback.
 DEFAULT_SPARK_IMAGE="ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support"
 DEFAULT_PUBLIC_IMAGE="lmsysorg/sglang:dev-Ling-3.0-flash"
+
+# ---- Speculative decoding selection -----------------------------------------
+# SPEC_ALGO=dspark (default) | nextn | off. ENABLE_NEXTN is honored as a legacy
+# override (ENABLE_NEXTN=0 -> off, otherwise nextn) when SPEC_ALGO is unset.
+if [[ -n "${SPEC_ALGO:-}" ]]; then
+  :
+elif [[ "${ENABLE_NEXTN:-}" == "0" ]]; then
+  SPEC_ALGO="off"
+elif [[ -n "${ENABLE_NEXTN:-}" ]]; then
+  SPEC_ALGO="nextn"
+else
+  SPEC_ALGO="dspark"
+fi
+case "${SPEC_ALGO}" in
+  dspark|nextn|off) ;;
+  *)
+    echo "FATAL: SPEC_ALGO must be 'dspark', 'nextn' or 'off' (got: ${SPEC_ALGO})"
+    exit 1
+    ;;
+esac
+# KDA ReplaySSM ring length for DSPARK: power of two, >= 2x the verify window
+# (block size 8 -> window 9). Cookbook recipe pins 32.
+REPLAYSSM_CACHE_LEN="${REPLAYSSM_CACHE_LEN:-32}"
+
 if [[ -z "${IMAGE:-}" ]]; then
   # Default: Spark GHCR (public; baked ling_v3_support for INT4). LMSYS is fallback
   # if the pull fails, or set USE_LMSYS_IMAGE=1 / IMAGE=lmsysorg/sglang:dev-Ling-3.0-flash.
-  if [[ "${USE_LMSYS_IMAGE:-0}" == "1" ]]; then
+  # DSPARK needs a recent SGLang (dspark_components / --enable-linear-replayssm-spec);
+  # the ling_v3_support image predates it, so dspark defaults to the LMSYS image.
+  if [[ "${USE_LMSYS_IMAGE:-0}" == "1" || "${SPEC_ALGO}" == "dspark" ]]; then
     IMAGE="${DEFAULT_PUBLIC_IMAGE}"
   else
     IMAGE="${DEFAULT_SPARK_IMAGE}"
@@ -33,7 +70,7 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
 CTX="${CTX:-262144}"
 WORK_DIR="$(pwd)"
-HF_HOME="${HOME}/.cache/huggingface"
+HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 PID_FILE="${WORK_DIR}/.sglang.pid"
 LOG_FILE="${WORK_DIR}/.sglang.log"
 BOOTSTRAP_SCRIPT="/tmp/ling-bootstrap.sh"
@@ -61,6 +98,11 @@ case "${1:-}" in
     echo "                     without starting SGLang."
     echo ""
     echo "  Environment variables:"
+    echo "    SPEC_ALGO              Speculative decoding: dspark (default) | nextn | off"
+    echo "                           dspark = DSPARK with the inclusionAI/Ling-3.0-flash-dspark"
+    echo "                           draft (defaults to the LMSYS image, needs recent SGLang)"
+    echo "    REPLAYSSM_CACHE_LEN    --linear-replayssm-cache-len for DSPARK (default: 32)"
+    echo "    ENABLE_NEXTN           Legacy: 1 -> SPEC_ALGO=nextn, 0 -> SPEC_ALGO=off"
     echo "    PORT                   Server port (default: 8888)"
     echo "    HOST                   Bind address for SGLang (default: 0.0.0.0)"
     echo "    CTX                    Context length (default: 262144 / 256k)"
@@ -68,7 +110,6 @@ case "${1:-}" in
     echo "    MAX_RUNNING_REQUESTS   (default: 6 concurrent)"
     echo "    MAX_MAMBA_CACHE_SIZE   (default: 32 on single Spark)"
     echo "    KV_CACHE_DTYPE         (default: fp8_e4m3; set empty to omit flag)"
-    echo "    ENABLE_NEXTN           (default: 1) pass --speculative-algorithm NEXTN; set to 0 to disable"
     echo "    DOCKER_MEMORY          optional docker --memory (e.g. 100g); also sets --memory-swap"
     echo "    IMAGE                  Docker image (default: ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support)"
     echo "    USE_LMSYS_IMAGE        set to 1 for lmsysorg/sglang:dev-Ling-3.0-flash instead"
@@ -138,14 +179,16 @@ if (( FREE_GIB < 100 )); then
   echo "WARN:  only ${FREE_GIB} GiB free on ${WORK_DIR} — keep an eye on disk usage."
 fi
 
-# Ports (host network: must be free on the host)
-if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") >/dev/null 2>&1; then
-  echo "FATAL: port ${PORT} is already in use — a server may already be running."
-  echo "       Run ./stop.sh first, or pick another port via PORT=<port>."
-  exit 1
-fi
-if (exec 3<>'/dev/tcp/127.0.0.1/2345') >/dev/null 2>&1; then
-  echo "WARN:  internal dist port 2345 is in use; SGLang may fail to bind."
+# Ports (host network: must be free on the host; not needed for --download-only)
+if ! ${DOWNLOAD_ONLY}; then
+  if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") >/dev/null 2>&1; then
+    echo "FATAL: port ${PORT} is already in use — a server may already be running."
+    echo "       Run ./stop.sh first, or pick another port via PORT=<port>."
+    exit 1
+  fi
+  if (exec 3<>'/dev/tcp/127.0.0.1/2345') >/dev/null 2>&1; then
+    echo "WARN:  internal dist port 2345 is in use; SGLang may fail to bind."
+  fi
 fi
 
 # ---- Env exports (also passed to container) ---------------------------------
@@ -233,6 +276,9 @@ echo ""
 echo "Checking model cache …"
 
 ensure_model "${MODEL_ID}" "Ling-3.0-flash-int4"
+if [[ "${SPEC_ALGO}" == "dspark" ]]; then
+  ensure_model "${DSPARK_MODEL_ID}" "Ling-3.0-flash-dspark (DSPARK draft)"
+fi
 echo ""
 
 # ---- Early exit for download-only mode --------------------------------------
@@ -390,6 +436,7 @@ fi
 
 echo "Starting SGLang server for ${MODEL_ID}"
 echo "Image: ${IMAGE}"
+echo "Spec decode: ${SPEC_ALGO}$( [[ "${SPEC_ALGO}" == "dspark" ]] && echo " (draft: ${DSPARK_MODEL_ID})")"
 echo "Listening on ${HOST}:${PORT}"
 echo "Context length: ${CTX}"
 echo ""
@@ -404,6 +451,18 @@ if [[ -z "${SNAPSHOT_DIR}" ]]; then
 fi
 MODEL_PATH_IN_CONTAINER="/root/.cache/huggingface/hub/models--${MODEL_ID//\//--}/snapshots/${SNAPSHOT_DIR}"
 echo "Model snapshot: ${HF_MODEL_CACHE}/snapshots/${SNAPSHOT_DIR}"
+
+DSPARK_PATH_IN_CONTAINER=""
+if [[ "${SPEC_ALGO}" == "dspark" ]]; then
+  DSPARK_CACHE="${HF_HOME}/hub/models--${DSPARK_MODEL_ID//\//--}"
+  DSPARK_SNAPSHOT_DIR="$(ls "${DSPARK_CACHE}/snapshots/" 2>/dev/null | head -1)"
+  if [[ -z "${DSPARK_SNAPSHOT_DIR}" ]]; then
+    echo "FATAL: Could not find snapshot for ${DSPARK_MODEL_ID} in ${DSPARK_CACHE}/snapshots/"
+    exit 1
+  fi
+  DSPARK_PATH_IN_CONTAINER="/root/.cache/huggingface/hub/models--${DSPARK_MODEL_ID//\//--}/snapshots/${DSPARK_SNAPSHOT_DIR}"
+  echo "DSPARK draft snapshot: ${DSPARK_CACHE}/snapshots/${DSPARK_SNAPSHOT_DIR}"
+fi
 echo ""
 
 echo "Pulling ${IMAGE} ..."
@@ -431,14 +490,29 @@ cat >"${LOG_FILE}" <<EOF
 [$(date -Is)] launching SGLang container (${MODEL_ID})
 EOF
 
-# Optional flags (Spark-safe defaults; NEXTN enabled by default as card recommends)
+# Optional flags (Spark-safe defaults; spec decode picked via SPEC_ALGO)
 EXTRA_ARGS=()
 if [[ -n "${KV_CACHE_DTYPE:-fp8_e4m3}" ]]; then
   EXTRA_ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}")
 fi
-if [[ "${ENABLE_NEXTN:-1}" == "1" ]]; then
-  EXTRA_ARGS+=(--speculative-algorithm NEXTN)
-fi
+case "${SPEC_ALGO}" in
+  dspark)
+    # Cookbook recipe: DSPARK + external draft + KDA ReplaySSM verify path.
+    # Draft block size (8) auto-infers from the checkpoint.
+    EXTRA_ARGS+=(
+      --speculative-algorithm DSPARK
+      --speculative-draft-model-path "${DSPARK_PATH_IN_CONTAINER}"
+      --enable-linear-replayssm-spec
+      --linear-replayssm-cache-len "${REPLAYSSM_CACHE_LEN}"
+    )
+    ;;
+  nextn)
+    EXTRA_ARGS+=(--speculative-algorithm NEXTN)
+    ;;
+  off)
+    # No speculative decoding
+    ;;
+esac
 
 # Optional host-safety memory cap (unified memory: prefer container death over host OOM)
 DOCKER_MEM_ARGS=()
@@ -541,5 +615,15 @@ echo ""
 echo "  Recommended client params:"
 echo "    temperature=0.6  top_p=0.95  top_k=20"
 echo '    chat_template_kwargs: {"enable_thinking": true}'
-echo "  NEXTN: enabled by default (--speculative-algorithm NEXTN); set ENABLE_NEXTN=0 to disable"
+case "${SPEC_ALGO}" in
+  dspark)
+    echo "  Spec decode: DSPARK with ${DSPARK_MODEL_ID} (ReplaySSM ring ${REPLAYSSM_CACHE_LEN})"
+    ;;
+  nextn)
+    echo "  Spec decode: NEXTN (built-in MTP); set SPEC_ALGO=dspark or off to change"
+    ;;
+  off)
+    echo "  Spec decode: off; set SPEC_ALGO=dspark or nextn to enable"
+    ;;
+esac
 echo "=============================================================================="

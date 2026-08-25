@@ -1,17 +1,24 @@
 # Ling-3.0-Flash SGLang for DGX Spark
 
-Self-hosted OpenAI-compatible endpoint for [inclusionAI/Ling-3.0-flash-int4](https://huggingface.co/inclusionAI/Ling-3.0-flash-int4) served with [SGLang](https://github.com/sgl-project/sglang) in Docker.
+Self-hosted OpenAI-compatible endpoint for [inclusionAI/Ling-3.0-flash-int4](https://huggingface.co/inclusionAI/Ling-3.0-flash-int4) served with [SGLang](https://github.com/sgl-project/sglang) in Docker, accelerated with the [inclusionAI/Ling-3.0-flash-dspark](https://huggingface.co/inclusionAI/Ling-3.0-flash-dspark) speculative draft.
 
 Designed and tested on a DGX Spark (GB10, SM121, ~128 GB unified memory) — the official INT4 recipe. `start.sh` and `stop.sh` are the only moving parts: they pull a prebuilt runtime, cache weights, and serve.
+
+> **Note on Ling-3.0-flash-dspark:** it is **not a standalone model** — it's a 1.36B-parameter, 5-layer **DSpark speculative-decoding draft** (trained with [SpecForge](https://github.com/sgl-project/SpecForge), extending [DFlash](https://github.com/z-lab/dflash) with target-model auxiliary features and a confidence head). It is served *alongside* the INT4 target via `--speculative-algorithm DSPARK --speculative-draft-model-path …` and typically accepts **~5.3 tokens per verification step** (macro mean across nine benchmarks; e.g. 6.4 on GSM8K, 3.5 on Alpaca).
 
 ## Quick start
 
 ```bash
-# 1. Download the INT4 weights
+# 1. Download the INT4 weights + DSpark draft
 ./start.sh --download-only
 
-# 2. Start the server (pulls prebuilt image; defaults: 256k context, 6 concurrent)
+# 2. Start the server (pulls prebuilt image; defaults: DSPARK spec decode,
+#    256k context, 6 concurrent)
 ./start.sh
+
+# Alternative speculative decoding:
+SPEC_ALGO=nextn ./start.sh   # built-in MTP (no extra checkpoint)
+SPEC_ALGO=off   ./start.sh   # no spec decode (high-throughput)
 
 # 3. Verify
 curl -fsS http://127.0.0.1:8888/v1/models
@@ -31,17 +38,15 @@ InclusionAI’s INT4 card still points at `github.com/inclusionAI/sglang_ling_v3
 
 | Image | When |
 |---|---|
-| **`ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support`** (default) | Public GHCR — NGC PyTorch + baked `ling_v3_support` (INT4 on Spark) |
-| `lmsysorg/sglang:dev-Ling-3.0-flash` | Official LMSYS Ling runtime (`USE_LMSYS_IMAGE=1` or `IMAGE=...`) |
+| **`lmsysorg/sglang:dev-Ling-3.0-flash`** (default for `SPEC_ALGO=dspark`) | Official LMSYS Ling runtime — recent SGLang with **DSPARK support** (`--enable-linear-replayssm-spec`, `dspark_components`) |
+| **`ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support`** (default for `SPEC_ALGO=nextn`/`off`) | Public GHCR — NGC PyTorch + baked `ling_v3_support` (INT4 on Spark; predates DSPARK) |
 
 ```bash
-# Default (Spark GHCR, public — no docker login)
+# Default (DSPARK → LMSYS image, public — no docker login)
 ./start.sh
 
-# Optional official LMSYS image
-USE_LMSYS_IMAGE=1 ./start.sh
-# or
-IMAGE=lmsysorg/sglang:dev-Ling-3.0-flash ./start.sh
+# Force the Spark GHCR image (only with SPEC_ALGO=nextn or off)
+SPEC_ALGO=nextn IMAGE=ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support ./start.sh
 ```
 
 Package: https://github.com/users/MiaAI-Lab/packages/container/package/ling-3.0-flash-sglang-dgx-spark
@@ -72,27 +77,37 @@ All optional. Defaults are conservative and tuned for a single Spark host.
 
 | Variable | Default | Description |
 |---|---|---|
+| `SPEC_ALGO` | `dspark` | Speculative decoding: `dspark` (DSPARK + external Ling-3.0-flash-dspark draft), `nextn` (built-in MTP), or `off` |
+| `REPLAYSSM_CACHE_LEN` | `32` | `--linear-replayssm-cache-len` for DSPARK (power of two ≥ 2× verify window 9) |
+| `ENABLE_NEXTN` | *(legacy)* | Backward-compat override: `0` → `SPEC_ALGO=off`, `1` → `nextn` (ignored when `SPEC_ALGO` is set) |
 | `PORT` | `8888` | Server port |
 | `CTX` | `262144` (256k) | Context length (script default; the live host runs this) |
-| `MEM_FRACTION_STATIC` | `0.75` | GPU memory utilization: fraction of the (unified) memory pool served to the model + KV (0.75 = 75%, 1.0 = everything). This host runs `0.70` |
+| `MEM_FRACTION_STATIC` | `0.75` | GPU memory utilization: fraction of the (unified) memory pool served to the model + KV (0.75 = 75%, 1.0 = everything). This host currently runs **`0.87`** (KV pool ≈ 577k tokens) |
 | `MAX_RUNNING_REQUESTS` | `6` | Max concurrent requests |
 | `MAX_MAMBA_CACHE_SIZE` | `32` | Mamba cache size (16 is a safer first run) |
-| `KV_CACHE_DTYPE` | `fp8_e4m3` | KV cache dtype; set to empty string to omit the flag |
-| `ENABLE_NEXTN` | `0` (script default) | MTP (multi-token prediction): set `1` for `--speculative-algorithm NEXTN`. Deployed profile runs with `1` |
+| `KV_CACHE_DTYPE` | `fp8_e4m3` | KV cache dtype; set to empty string to omit the flag. fp8 halves KV memory (~23 GB for a 577k-token pool at 0.87) |
 | `DOCKER_MEMORY` | *(unset)* | Cap the container, e.g. `100g` — preferred on unified-memory hosts so the container dies before the host OOMs |
-| `IMAGE` | `ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support` | Prebuilt SGLang (public GHCR; no private git) |
-| `USE_LMSYS_IMAGE` | `0` | Set `1` to use `lmsysorg/sglang:dev-Ling-3.0-flash` instead |
+| `IMAGE` | `lmsysorg/sglang:dev-Ling-3.0-flash` (dspark) / `ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support` (nextn/off) | Prebuilt SGLang (public; no private git) |
+| `USE_LMSYS_IMAGE` | `0` | Set `1` to force `lmsysorg/sglang:dev-Ling-3.0-flash` |
 | `HF_TOKEN` | *(empty)* | Hugging Face token for gated models |
 | `HF_HOME` | `~/.cache/huggingface` | Where weights are cached |
 | `FORCE_SOURCE_BUILD` | `0` | Set `1` only to rebuild from `SGLANG_REPO` (usually unnecessary) |
 
-**This host's deployment profile** matches the script defaults: **256k context (`CTX=262144`)**, **6 concurrent** (`MAX_RUNNING_REQUESTS`), plus the live host also runs `ENABLE_NEXTN=1` (MTP), `MEM_FRACTION_STATIC=0.70`, mamba cache 16, `DOCKER_MEMORY=100g`. For resource-constrained hosts, the script defaults can be pulled back per launch with `CTX=8192 MAX_RUNNING_REQUESTS=1 ENABLE_NEXTN=0`.
+**This host's current deployment profile**: **256k context (`CTX=262144`)**, **6 concurrent** (`MAX_RUNNING_REQUESTS=6`), **DSPARK speculative decoding** (`SPEC_ALGO=dspark`), **`MEM_FRACTION_STATIC=0.87`**, mamba cache 32, fp8_e4m3 KV — yielding a **576,930-token KV pool** (2.2× the full 256k context; ~96k tokens of KV headroom per request at 6 concurrent). No `DOCKER_MEMORY` cap is set; host `MemAvailable` sits at ~9.5 GiB, stable but leaving little room for anything else on the box. For resource-constrained hosts, pull back per launch with `CTX=8192 MAX_RUNNING_REQUESTS=1 SPEC_ALGO=off`.
 
-Example matching the server:
+Example matching the live server:
 
 ```bash
-MEM_FRACTION_STATIC=0.70 MAX_RUNNING_REQUESTS=6 MAX_MAMBA_CACHE_SIZE=16 CTX=262144 ENABLE_NEXTN=1 DOCKER_MEMORY=100g ./start.sh
+MEM_FRACTION_STATIC=0.87 MAX_RUNNING_REQUESTS=6 MAX_MAMBA_CACHE_SIZE=32 CTX=262144 SPEC_ALGO=dspark ./start.sh
 ```
+
+KV pool vs `MEM_FRACTION_STATIC` (measured on this host, fp8_e4m3, DSPARK):
+
+| `MEM_FRACTION_STATIC` | KV pool (tokens) | KV memory | Free GPU-side mem after graphs | Host `MemAvailable` |
+|---|---|---|---|---|
+| 0.75 | 237,922 | ~9.1 GB | 26.8 GB | ~24 GB |
+| 0.80 | 328,898 | ~12.5 GB | 22.0 GB | ~20 GB |
+| 0.87 | 576,930 | ~23.2 GB | 10.2 GB | ~9.5 GB |
 
 ## Endpoint
 
@@ -117,7 +132,22 @@ Default request config (recommended — matches the server's defaults):
 
 ## Performance
 
-Decode throughput for `inclusionAI/Ling-3.0-flash-int4` on this DGX Spark (GB10), measured during the bring-up baseline (`MEM_FRACTION_STATIC=0.75`, `--chunked-prefill-size 8192`, INT4 `ling_v3_support`):
+### Current (DSPARK, `lmsysorg/sglang:dev-Ling-3.0-flash`, `MEM_FRACTION_STATIC=0.87`)
+
+With the external Ling-3.0-flash-dspark draft active, decode throughput on this DGX Spark (GB10), `--chunked-prefill-size 8192`, fp8_e4m3 KV:
+
+| Concurrency | Aggregate (tok/s) | Per-request (tok/s) | TTFT |
+|---|---|---|---|
+| ×1 | 83 | 83 | 1.44 s |
+| ×2 | 84 | 55 | 482 ms |
+| ×4 | 107 | 33 | 1.75 s |
+| ×6 | 136 | 29 | 529 ms |
+
+vs the NEXTN baseline below: **2.2× faster at ×1** (83 vs 37 tok/s) and **1.8× at ×6** (136 vs 76 tok/s). Observed **accept length 5.2–6.4** (accept rate 0.53–0.67), consistent with the draft card's reported macro mean of 5.29 across nine benchmarks (6.40 GSM8K, 6.57 HumanEval, 3.51 Alpaca). Startup: ~160 s weight load + ~2 min draft/verify CUDA-graph capture.
+
+### Baseline (NEXTN MTP, INT4 `ling_v3_support`, `MEM_FRACTION_STATIC=0.75`)
+
+Decode throughput for `inclusionAI/Ling-3.0-flash-int4` on this DGX Spark (GB10), measured during the bring-up baseline (`MEM_FRACTION_STATIC=0.75`, `--chunked-prefill-size 8192`):
 
 | Concurrency | Aggregate (tok/s) | Per-request (tok/s) | TTFT |
 |---|---|---|---|
@@ -129,7 +159,7 @@ Decode throughput for `inclusionAI/Ling-3.0-flash-int4` on this DGX Spark (GB10)
 
 **agg** = server-wide decoded tokens per second; **str** = per-request tokens per second; **TTFT** = time to first token.
 
-Note the ×6 spike: 4.99 s TTFT at 6 concurrent requests — batch efficiency degrades past ×5 under this configuration.
+Note the ×6 spike: 4.99 s TTFT at 6 concurrent requests — batch efficiency degrades past ×5 under this configuration. TTFT under DSPARK is more erratic (1.44 s at ×1 vs 529 ms at ×6) but throughput scales much better; aggregate decode grows monotonically with concurrency instead of flattening.
 
 ## Files
 
@@ -140,8 +170,8 @@ Note the ×6 spike: 4.99 s TTFT at 6 concurrent requests — batch efficiency de
 
 ## How it works
 
-1. `start.sh` caches the `Ling-3.0-flash-int4` weights under `$HF_HOME` (uses `hf`, `huggingface-cli`, or falls back to a Docker download).
-2. It pulls a **public prebuilt** image with SGLang already installed (no `git clone` of the private InclusionAI fork).
+1. `start.sh` caches the `Ling-3.0-flash-int4` weights (and, for DSPARK, the 2.7 GB `Ling-3.0-flash-dspark` draft) under `$HF_HOME` (uses `hf`, `huggingface-cli`, or falls back to a Docker download).
+2. It pulls a **public prebuilt** image with SGLang already installed (no `git clone` of the private InclusionAI fork). DSPARK uses `lmsysorg/sglang:dev-Ling-3.0-flash` because DSPARK support (`dspark_components`, `--enable-linear-replayssm-spec`) postdates the `ling_v3_support` build.
 3. The container runs with `--network host`, `--ipc host`, `--gpus all`, `--shm-size=32g`, and the model snapshot from the HF cache.
 4. `start.sh` tails the logs and blocks until `/v1/models` responds, then prints the endpoint.
 
@@ -149,8 +179,8 @@ Note the ×6 spike: 4.99 s TTFT at 6 concurrent requests — batch efficiency de
 
 ## Notes & safety
 
-- **Unified memory**: model weights, compile and KV cache all share host RAM. Keep `MEM_FRACTION_STATIC` at ≤ `0.75` and consider `DOCKER_MEMORY`. If free memory drops below ~10 GB during load, stop the container with `./stop.sh`.
-- **Context & concurrency**: the script defaults are **256k context** and **6 concurrent requests** (`CTX=262144 MAX_RUNNING_REQUESTS=6`) — matching this host. MTP is opt-in via `ENABLE_NEXTN=1` (enabled here). Constrained hosts can pull back per launch: `CTX=8192 MAX_RUNNING_REQUESTS=1 ENABLE_NEXTN=0`.
+- **Unified memory**: model weights, compile and KV cache all share host RAM. `0.75` is the safe default; the current `0.87` deployment leaves only ~9.5 GiB host `MemAvailable` (stable at rest, but nothing else big should run on the box). If `MemAvailable` keeps falling below ~10 GB during load, or you see container restarts, stop with `./stop.sh` and relaunch at `MEM_FRACTION_STATIC≤0.80`. Consider `DOCKER_MEMORY` so the container dies before the host OOMs.
+- **Context & concurrency**: the script defaults are **256k context** and **6 concurrent requests** (`CTX=262144 MAX_RUNNING_REQUESTS=6`) — matching this host. Spec decode defaults to **DSPARK** (external draft, `SPEC_ALGO=dspark`); switch with `SPEC_ALGO=nextn` (built-in MTP) or `SPEC_ALGO=off`. At high batch saturation, spec-decode overhead can outweigh the speedup — prefer `SPEC_ALGO=off` for batch jobs. Constrained hosts can pull back per launch: `CTX=8192 MAX_RUNNING_REQUESTS=1 SPEC_ALGO=off`.
 
 ## Monitoring memory & GPU
 
@@ -165,7 +195,7 @@ free -h            # watch MemAvailable, not the "free" column
 watch -n2 free -h  # live view while the server is loading/serving
 ```
 
-While loading, expect GPU utilization to rise and MemAvailable to fall as weights + KV cache fill host RAM. If MemAvailable drops below ~10 GB and keeps falling (or you see container restarts), stop with `./stop.sh` and relaunch with a leaner profile (`CTX=8192 MAX_RUNNING_REQUESTS=1 ENABLE_NEXTN=0`, `MEM_FRACTION_STATIC≤0.70`).
+While loading, expect GPU utilization to rise and MemAvailable to fall as weights + KV cache fill host RAM. If MemAvailable drops below ~10 GB and keeps falling (or you see container restarts), stop with `./stop.sh` and relaunch with a leaner profile (`CTX=8192 MAX_RUNNING_REQUESTS=1 SPEC_ALGO=off`, `MEM_FRACTION_STATIC≤0.80`).
 
 - `curl http://127.0.0.1:8888/v1/models` fails → `docker logs ling-3.0-flash-int4` (first build takes minutes; startup-looking output will stream).
 - Container vanished before ready → `./stop.sh` then relaunch with `DOCKER_MEMORY=100g` and see logs.
@@ -173,5 +203,6 @@ While loading, expect GPU utilization to rise and MemAvailable to fall as weight
 
 ## License & credits
 
-- Model weights: [inclusionAI/Ling-3.0-flash-int4](https://huggingface.co/inclusionAI/Ling-3.0-flash-int4) (InclusionAI) — check the model card for its license
+- Model weights: [inclusionAI/Ling-3.0-flash-int4](https://huggingface.co/inclusionAI/Ling-3.0-flash-int4) and draft [inclusionAI/Ling-3.0-flash-dspark](https://huggingface.co/inclusionAI/Ling-3.0-flash-dspark) (InclusionAI) — check the model cards for their licenses
 - SGLang: [sgl-project/sglang](https://github.com/sgl-project/sglang)
+- DSpark extends [DFlash](https://github.com/z-lab/dflash); trained with [SpecForge](https://github.com/sgl-project/SpecForge)
