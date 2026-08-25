@@ -1,5 +1,5 @@
 # Only track the public surface of this repo: start/stop scripts and README.
-# Everything else here is machine-local state.
+# Everything else here is machine-local state from running the server.
 
 # Ignore everything by default…
 /*
@@ -9,3 +9,10 @@
 !/start.sh
 !/stop.sh
 !/README.md
+
+# Machine-local runtime state produced by start.sh / stop.sh (belt & suspenders;
+# already covered by the /* ignore above):
+#   .sglang.pid       — running container ID
+#   .sglang.log       — launch log
+#   .sglang-persist/  — optional host-side SGLang install
+#   sglang_storage/   — server file storage (tool uploads)
