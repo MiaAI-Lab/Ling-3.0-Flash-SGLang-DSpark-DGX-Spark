@@ -1,34 +1,58 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  start.sh — inclusionAI/Ling-3.0-flash-int4 on DGX Spark (GB10 / SM121)
+#  start.sh — Ling-3.0-flash on one DGX Spark (GB10 / SM121, TP1)
 #
-#  Default: public prebuilt Docker image — no private GitHub clone required.
-#  Spark: tp-size 1, conservative mem defaults. No flashinfer_mxfp4 / FP4.
+#  Default: official GB10 MXFP4 + DSPARK cell from sgl-project/sglang#36364
+#           (open cookbook PR, measured on a real GB10). Public LMSYS image —
+#           no private GitHub clone required.
+#
+#  QUANT:
+#    mxfp4 — inclusionAI/Ling-3.0-flash-fp4 + --moe-runner-backend flashinfer_mxfp4
+#    int4  — inclusionAI/Ling-3.0-flash-int4 (previous proven Spark path)
 #
 #  Speculative decoding (SPEC_ALGO):
 #    dspark — DSPARK with the external inclusionAI/Ling-3.0-flash-dspark draft
-#             (1.36B, 5 layers; needs a recent SGLang → defaults to the LMSYS
-#             Ling image). Verify window 9 (block size 8) with the KDA
-#             ReplaySSM ring pinned to --linear-replayssm-cache-len 32.
-#    nextn  — built-in MTP layer (no extra checkpoint; ling_v3_support image OK)
-#    off    — no speculative decoding
+#             (1.36B, 5 layers; needs a recent SGLang → LMSYS Ling image).
+#             Verify window 9 (block size 8) with the KDA ReplaySSM ring
+#             pinned to --linear-replayssm-cache-len 32.
+#    nextn  — built-in MTP layer (no extra checkpoint)
+#    off    — no speculative decoding (high-throughput)
 # =============================================================================
 set -euo pipefail
 
 # ---- Configuration ----------------------------------------------------------
-MODEL_ID="inclusionAI/Ling-3.0-flash-int4"
 # External DSpark draft checkpoint for --speculative-algorithm DSPARK
 # https://huggingface.co/inclusionAI/Ling-3.0-flash-dspark
 DSPARK_MODEL_ID="inclusionAI/Ling-3.0-flash-dspark"
+DSPARK_REVISION="${DSPARK_REVISION:-8e5d9988c9b09de13f1f7c9d999ff2bfa533a149}"
 # Public images (new users need one of these — never requires inclusionAI/sglang_ling_v3):
-#   1) Spark-tuned (baked ling_v3_support): ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support
-#   2) Official LMSYS Ling-3.0 runtime:     lmsysorg/sglang:dev-Ling-3.0-flash
+#   1) Official LMSYS Ling-3.0 runtime:     lmsysorg/sglang:dev-Ling-3.0-flash
+#   2) Spark-tuned (baked ling_v3_support): ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support
+#      INT4 + NEXTN/off only — predates DSPARK and FlashInfer MXFP4.
 # Source rebuild only if you set IMAGE to a bare base (e.g. nvcr.io/nvidia/pytorch:26.01-py3)
 # and FORCE_SOURCE_BUILD=1 (needs a public SGLANG_REPO mirror; official fork is often private).
-# Always default to a public registry image. Spark-tuned GHCR is preferred on
-# aarch64 when available; LMSYS is the universal public fallback.
 DEFAULT_SPARK_IMAGE="ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support"
 DEFAULT_PUBLIC_IMAGE="lmsysorg/sglang:dev-Ling-3.0-flash"
+
+# ---- Quantization (QUANT=mxfp4 default | int4) ------------------------------
+# fp4 is accepted as an alias for mxfp4 (Hugging Face repo is *-fp4).
+QUANT="${QUANT:-mxfp4}"
+case "${QUANT}" in
+  mxfp4|fp4)
+    QUANT="mxfp4"
+    MODEL_ID="inclusionAI/Ling-3.0-flash-fp4"
+    MODEL_REVISION="${MODEL_REVISION:-3bae1cf4011b48475b2cc038fff283af49053ebc}"
+    ;;
+  int4)
+    QUANT="int4"
+    MODEL_ID="inclusionAI/Ling-3.0-flash-int4"
+    MODEL_REVISION="${MODEL_REVISION:-7a27e9eb8179b2c2eb71eb214f0dab14ec6a63f2}"
+    ;;
+  *)
+    echo "FATAL: QUANT must be 'mxfp4' or 'int4' (got: ${QUANT})"
+    exit 1
+    ;;
+esac
 
 # ---- Speculative decoding selection -----------------------------------------
 # SPEC_ALGO=dspark (default) | nextn | off. ENABLE_NEXTN is honored as a legacy
@@ -53,18 +77,25 @@ esac
 # (block size 8 -> window 9). Cookbook recipe pins 32.
 REPLAYSSM_CACHE_LEN="${REPLAYSSM_CACHE_LEN:-32}"
 
+# Official GB10 MXFP4 cell uses 0.85; INT4 stays at the safer 0.75 Spark default.
+if [[ -z "${MEM_FRACTION_STATIC:-}" ]]; then
+  if [[ "${QUANT}" == "mxfp4" ]]; then
+    MEM_FRACTION_STATIC="0.85"
+  else
+    MEM_FRACTION_STATIC="0.75"
+  fi
+fi
+
 if [[ -z "${IMAGE:-}" ]]; then
-  # Default: Spark GHCR (public; baked ling_v3_support for INT4). LMSYS is fallback
-  # if the pull fails, or set USE_LMSYS_IMAGE=1 / IMAGE=lmsysorg/sglang:dev-Ling-3.0-flash.
-  # DSPARK needs a recent SGLang (dspark_components / --enable-linear-replayssm-spec);
-  # the ling_v3_support image predates it, so dspark defaults to the LMSYS image.
-  if [[ "${USE_LMSYS_IMAGE:-0}" == "1" || "${SPEC_ALGO}" == "dspark" ]]; then
+  # MXFP4 needs FlashInfer CUTLASS MXFP4; DSPARK needs dspark_components.
+  # Both live in the LMSYS Ling image. GHCR ling_v3_support is INT4+NEXTN only.
+  if [[ "${USE_LMSYS_IMAGE:-0}" == "1" || "${SPEC_ALGO}" == "dspark" || "${QUANT}" == "mxfp4" ]]; then
     IMAGE="${DEFAULT_PUBLIC_IMAGE}"
   else
     IMAGE="${DEFAULT_SPARK_IMAGE}"
   fi
 fi
-CONTAINER_NAME="ling-3.0-flash-int4"
+CONTAINER_NAME="${CONTAINER_NAME:-ling-3.0-flash}"
 # Bind address for sglang serve / launch_server (--host). Docker uses --network host.
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
@@ -98,6 +129,7 @@ case "${1:-}" in
     echo "                     without starting SGLang."
     echo ""
     echo "  Environment variables:"
+    echo "    QUANT                  mxfp4 (default, official GB10 cell) | int4"
     echo "    SPEC_ALGO              Speculative decoding: dspark (default) | nextn | off"
     echo "                           dspark = DSPARK with the inclusionAI/Ling-3.0-flash-dspark"
     echo "                           draft (defaults to the LMSYS image, needs recent SGLang)"
@@ -106,13 +138,15 @@ case "${1:-}" in
     echo "    PORT                   Server port (default: 8888)"
     echo "    HOST                   Bind address for SGLang (default: 0.0.0.0)"
     echo "    CTX                    Context length (default: 262144 / 256k)"
-    echo "    MEM_FRACTION_STATIC    SGLang static mem fraction (default: 0.75)"
+    echo "    MEM_FRACTION_STATIC    SGLang static mem fraction (default: 0.85 mxfp4 / 0.75 int4)"
     echo "    MAX_RUNNING_REQUESTS   (default: 6 concurrent)"
     echo "    MAX_MAMBA_CACHE_SIZE   (default: 32 on single Spark)"
     echo "    KV_CACHE_DTYPE         (default: fp8_e4m3; set empty to omit flag)"
     echo "    DOCKER_MEMORY          optional docker --memory (e.g. 100g); also sets --memory-swap"
-    echo "    IMAGE                  Docker image (default: ghcr.io/miaai-lab/ling-3.0-flash-sglang-dgx-spark:ling_v3_support)"
-    echo "    USE_LMSYS_IMAGE        set to 1 for lmsysorg/sglang:dev-Ling-3.0-flash instead"
+    echo "    IMAGE                  Docker image (default: lmsysorg/sglang:dev-Ling-3.0-flash)"
+    echo "    USE_LMSYS_IMAGE        set to 1 to force the LMSYS Ling image"
+    echo "    MODEL_REVISION         Pin target snapshot (defaults per QUANT)"
+    echo "    DSPARK_REVISION        Pin draft snapshot"
     echo "    HF_TOKEN               Hugging Face token for gated models"
     echo "    FORCE_SOURCE_BUILD     set to 1 to git-clone SGLANG_REPO into the container"
     echo "                           (not needed for public prebuilt images)"
@@ -161,7 +195,7 @@ fi
 # Host memory (unified memory: model + compile + KV all share host RAM)
 MEM_TOTAL_GIB=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 / 1024 ))
 if (( MEM_TOTAL_GIB < 80 )); then
-  echo "FATAL: host has only ${MEM_TOTAL_GIB} GiB RAM; Ling-3.0-flash-int4 needs ~100+ GiB."
+  echo "FATAL: host has only ${MEM_TOTAL_GIB} GiB RAM; Ling-3.0-flash needs ~100+ GiB."
   exit 1
 fi
 if (( MEM_TOTAL_GIB < 110 )); then
@@ -218,21 +252,40 @@ model_is_fully_cached() {
   return 1
 }
 
+snapshot_for() {
+  local model_id="$1" revision="${2:-}"
+  local cache_dir snapshot
+  cache_dir="$(hf_cache_repo_dir "${model_id}")"
+  if [[ -n "${revision}" && -d "${cache_dir}/snapshots/${revision}" ]]; then
+    echo "${revision}"
+    return 0
+  fi
+  for snapshot in "${cache_dir}"/snapshots/*/; do
+    [[ -d "${snapshot}" ]] || continue
+    basename "${snapshot}"
+    return 0
+  done
+  return 1
+}
+
 download_model() {
-  local model_id="$1"
+  local model_id="$1" revision="${2:-}"
   echo ""
   echo "  >> Downloading ${model_id} …"
   echo "     (cache: ${HF_HOME})"
+  [[ -n "${revision}" ]] && echo "     (revision: ${revision})"
   echo "     This can take a while for large models."
 
   if command -v hf >/dev/null 2>&1; then
     HF_HOME="${HF_HOME}" hf download "${model_id}" \
+      ${revision:+--revision "${revision}"} \
       ${HF_TOKEN:+--token "${HF_TOKEN}"}
     return
   fi
 
   if command -v huggingface-cli >/dev/null 2>&1; then
     HF_HOME="${HF_HOME}" huggingface-cli download "${model_id}" \
+      ${revision:+--revision "${revision}"} \
       ${HF_TOKEN:+--token "${HF_TOKEN}"}
     return
   fi
@@ -247,17 +300,17 @@ download_model() {
     -c "
 import os
 from huggingface_hub import snapshot_download
-snapshot_download('${model_id}', token=os.environ.get('HF_TOKEN') or None)
+snapshot_download('${model_id}', revision='${revision}' or None, token=os.environ.get('HF_TOKEN') or None)
 "
 }
 
 ensure_model() {
-  local model_id="$1" label="$2"
-  if model_is_fully_cached "${model_id}"; then
-    echo "  [✓] ${label} (${model_id}) is cached"
+  local model_id="$1" label="$2" revision="${3:-}"
+  if model_is_fully_cached "${model_id}" && { [[ -z "${revision}" ]] || [[ -d "$(hf_cache_repo_dir "${model_id}")/snapshots/${revision}" ]]; }; then
+    echo "  [✓] ${label} (${model_id} @ ${revision:-cached}) is cached"
   else
     echo "  [↓] ${label} not cached — downloading …"
-    download_model "${model_id}"
+    download_model "${model_id}" "${revision}"
     if model_is_fully_cached "${model_id}"; then
       echo "  [✓] ${label} download complete"
     else
@@ -269,15 +322,15 @@ ensure_model() {
 
 # ---- Download model (idempotent) --------------------------------------------
 echo "=============================================================================="
-echo "  Ling-3.0-flash-int4  —  InclusionAI"
+echo "  Ling-3.0-flash ${QUANT}  —  InclusionAI  —  1x DGX Spark"
 echo "  $(date)"
 echo "=============================================================================="
 echo ""
 echo "Checking model cache …"
 
-ensure_model "${MODEL_ID}" "Ling-3.0-flash-int4"
+ensure_model "${MODEL_ID}" "Ling-3.0-flash-${QUANT}" "${MODEL_REVISION}"
 if [[ "${SPEC_ALGO}" == "dspark" ]]; then
-  ensure_model "${DSPARK_MODEL_ID}" "Ling-3.0-flash-dspark (DSPARK draft)"
+  ensure_model "${DSPARK_MODEL_ID}" "Ling-3.0-flash-dspark (DSPARK draft)" "${DSPARK_REVISION}"
 fi
 echo ""
 
@@ -330,7 +383,7 @@ activate_venv_if_present() {
 }
 
 launch_sglang() {
-  echo "[bootstrap] Starting SGLang server (Ling-3.0-flash-int4) …"
+  echo "[bootstrap] Starting SGLang server (Ling-3.0-flash) …"
   if activate_venv_if_present; then
     exec python -m sglang.launch_server "\$@"
   fi
@@ -435,19 +488,24 @@ if docker ps -a --format '{{.Names}}' | grep -qx "ling-3.0-flash-fp4"; then
 fi
 
 echo "Starting SGLang server for ${MODEL_ID}"
+echo "Quant: ${QUANT}"
 echo "Image: ${IMAGE}"
 echo "Spec decode: ${SPEC_ALGO}$( [[ "${SPEC_ALGO}" == "dspark" ]] && echo " (draft: ${DSPARK_MODEL_ID})")"
 echo "Listening on ${HOST}:${PORT}"
 echo "Context length: ${CTX}"
+echo "Mem fraction: ${MEM_FRACTION_STATIC}"
 echo ""
 
 # Resolve snapshot path for the model (must be done before docker run)
 HF_MODEL_CACHE="${HF_HOME}/hub/models--${MODEL_ID//\//--}"
-SNAPSHOT_DIR="$(ls "${HF_MODEL_CACHE}/snapshots/" 2>/dev/null | head -1)"
+SNAPSHOT_DIR="$(snapshot_for "${MODEL_ID}" "${MODEL_REVISION}" || true)"
 if [[ -z "${SNAPSHOT_DIR}" ]]; then
   echo "FATAL: Could not find snapshot for ${MODEL_ID} in ${HF_MODEL_CACHE}/snapshots/"
   echo "       Run with --download-only first, or check your HF_HOME."
   exit 1
+fi
+if [[ "${SNAPSHOT_DIR}" != "${MODEL_REVISION}" ]]; then
+  echo "WARN:  using snapshot ${SNAPSHOT_DIR}, not pinned revision ${MODEL_REVISION}"
 fi
 MODEL_PATH_IN_CONTAINER="/root/.cache/huggingface/hub/models--${MODEL_ID//\//--}/snapshots/${SNAPSHOT_DIR}"
 echo "Model snapshot: ${HF_MODEL_CACHE}/snapshots/${SNAPSHOT_DIR}"
@@ -455,10 +513,13 @@ echo "Model snapshot: ${HF_MODEL_CACHE}/snapshots/${SNAPSHOT_DIR}"
 DSPARK_PATH_IN_CONTAINER=""
 if [[ "${SPEC_ALGO}" == "dspark" ]]; then
   DSPARK_CACHE="${HF_HOME}/hub/models--${DSPARK_MODEL_ID//\//--}"
-  DSPARK_SNAPSHOT_DIR="$(ls "${DSPARK_CACHE}/snapshots/" 2>/dev/null | head -1)"
+  DSPARK_SNAPSHOT_DIR="$(snapshot_for "${DSPARK_MODEL_ID}" "${DSPARK_REVISION}" || true)"
   if [[ -z "${DSPARK_SNAPSHOT_DIR}" ]]; then
     echo "FATAL: Could not find snapshot for ${DSPARK_MODEL_ID} in ${DSPARK_CACHE}/snapshots/"
     exit 1
+  fi
+  if [[ "${DSPARK_SNAPSHOT_DIR}" != "${DSPARK_REVISION}" ]]; then
+    echo "WARN:  using DSPARK snapshot ${DSPARK_SNAPSHOT_DIR}, not pinned revision ${DSPARK_REVISION}"
   fi
   DSPARK_PATH_IN_CONTAINER="/root/.cache/huggingface/hub/models--${DSPARK_MODEL_ID//\//--}/snapshots/${DSPARK_SNAPSHOT_DIR}"
   echo "DSPARK draft snapshot: ${DSPARK_CACHE}/snapshots/${DSPARK_SNAPSHOT_DIR}"
@@ -492,6 +553,10 @@ EOF
 
 # Optional flags (Spark-safe defaults; spec decode picked via SPEC_ALGO)
 EXTRA_ARGS=()
+if [[ "${QUANT}" == "mxfp4" ]]; then
+  # Official GB10 cell (sgl-project/sglang#36364): FlashInfer CUTLASS MXFP4 MoE.
+  EXTRA_ARGS+=(--moe-runner-backend flashinfer_mxfp4)
+fi
 if [[ -n "${KV_CACHE_DTYPE:-fp8_e4m3}" ]]; then
   EXTRA_ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}")
 fi
@@ -513,6 +578,15 @@ case "${SPEC_ALGO}" in
     # No speculative decoding
     ;;
 esac
+# Split reasoning into the reasoning field. Ling's chat template defaults
+# thinking OFF; without this the ling3 parser dumps <think> into content.
+# Set DEFAULT_CHAT_TEMPLATE_KWARGS= empty to omit (older images may lack the flag).
+if [[ -z "${DEFAULT_CHAT_TEMPLATE_KWARGS+x}" ]]; then
+  DEFAULT_CHAT_TEMPLATE_KWARGS='{"enable_thinking":true,"thinking":true}'
+fi
+if [[ -n "${DEFAULT_CHAT_TEMPLATE_KWARGS}" ]]; then
+  EXTRA_ARGS+=(--default-chat-template-kwargs "${DEFAULT_CHAT_TEMPLATE_KWARGS}")
+fi
 
 # Optional host-safety memory cap (unified memory: prefer container death over host OOM)
 DOCKER_MEM_ARGS=()
@@ -560,7 +634,7 @@ docker run -d \
     --chunked-prefill-size 8192 \
     --allow-auto-truncate \
     --context-length "${CTX}" \
-    --mem-fraction-static "${MEM_FRACTION_STATIC:-0.75}" \
+    --mem-fraction-static "${MEM_FRACTION_STATIC}" \
     --tool-call-parser ling3 \
     --reasoning-parser ling3 \
     --enable-fp32-lm-head \
@@ -605,7 +679,7 @@ cleanup
 echo ""
 echo "=============================================================================="
 echo "  SGLang is ready!"
-echo "  Model: ${MODEL_ID}"
+echo "  Model: ${MODEL_ID} (${QUANT})"
 if [[ "${HOST}" == "0.0.0.0" || "${HOST}" == "::" ]]; then
   echo "  OpenAI-compatible endpoint:  http://127.0.0.1:${PORT}/v1  (bound on ${HOST})"
 else
@@ -614,7 +688,7 @@ fi
 echo ""
 echo "  Recommended client params:"
 echo "    temperature=0.6  top_p=0.95  top_k=20"
-echo '    chat_template_kwargs: {"enable_thinking": true}'
+echo '    chat_template_kwargs: {"enable_thinking": true}  (server default is on)'
 case "${SPEC_ALGO}" in
   dspark)
     echo "  Spec decode: DSPARK with ${DSPARK_MODEL_ID} (ReplaySSM ring ${REPLAYSSM_CACHE_LEN})"
