@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  stop.sh — Stop and remove the Ling-3.0-flash-int4 SGLang container
+#  stop.sh — Stop and remove the Ling-3.0-flash SGLang container
 #
 #  Works regardless of speculative-decoding mode (DSPARK draft / NEXTN / off):
 #  it simply stops and removes the container started by start.sh.
@@ -19,7 +19,8 @@ set -euo pipefail
 
 # ---- Configuration ----------------------------------------------------------
 # Keep in sync with start.sh. Override if you launched with a custom name.
-CONTAINER_NAME="${CONTAINER_NAME:-ling-3.0-flash-int4}"
+CONTAINER_NAME="${CONTAINER_NAME:-ling-3.0-flash}"
+LEGACY_CONTAINER_NAME="ling-3.0-flash-int4"
 WORK_DIR="$(pwd)"
 PID_FILE="${WORK_DIR}/.sglang.pid"
 LOG_FILE="${WORK_DIR}/.sglang.log"
@@ -36,13 +37,13 @@ case "${1:-}" in
     echo "Usage: $0 [-f|--force]"
     echo ""
     echo "  Stops and removes the ${CONTAINER_NAME} Docker container"
-    echo "  (Ling-3.0-flash-int4 served with SGLang, any spec-decode mode:"
-    echo "   DSPARK draft / NEXTN / off)."
+    echo "  (Ling-3.0-flash MXFP4 or INT4 served with SGLang, any spec-decode"
+    echo "   mode: DSPARK draft / NEXTN / off)."
     echo ""
     echo "  -f, --force    Skip confirmation prompt"
     echo ""
     echo "  Environment:"
-    echo "    CONTAINER_NAME  Container to stop (default: ling-3.0-flash-int4)"
+    echo "    CONTAINER_NAME  Container to stop (default: ling-3.0-flash)"
     exit 0
     ;;
   "")
@@ -57,12 +58,15 @@ esac
 # ---- Prerequisite checks ----------------------------------------------------
 command -v docker >/dev/null 2>&1 || { echo "FATAL: docker is required"; exit 1; }
 
-# ---- Check container exists -------------------------------------------------
+# Prefer the current name; fall back to the old INT4-only container name.
 if ! docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
-  echo "Container ${CONTAINER_NAME} not found — nothing to stop."
-  # Clean up stale artifacts even if the container is gone
-  rm -f "${PID_FILE}" "${LOG_FILE}" "${BOOTSTRAP_SCRIPT}"
-  exit 0
+  if docker ps -a --format '{{.Names}}' | grep -qx "${LEGACY_CONTAINER_NAME}"; then
+    CONTAINER_NAME="${LEGACY_CONTAINER_NAME}"
+  else
+    echo "Container ${CONTAINER_NAME} not found — nothing to stop."
+    rm -f "${PID_FILE}" "${LOG_FILE}" "${BOOTSTRAP_SCRIPT}"
+    exit 0
+  fi
 fi
 
 # ---- Show container status --------------------------------------------------
